@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Dropbox Video Browser</title>
+  </head>
+  <body>
+    <div id="shell">
+      <nav id="nav">
+        <div class="nav-logo">Video Summarizer</div>
+        <button class="nav-item active" data-view="videos">Videos</button>
+        <button class="nav-item" data-view="prompts">Prompts</button>
+      </nav>
+      <div id="app"></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
