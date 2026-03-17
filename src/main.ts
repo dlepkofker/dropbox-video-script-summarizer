@@ -16,7 +16,7 @@ function parseFields(text: string): string[] {
   return [...new Set(matches.map((m) => m.slice(2, -2)))];
 }
 
-const SERVER_URL = import.meta.env.VITE_SERVER_URL as string | undefined ?? 'http://localhost:3001';
+const SERVER_URL = import.meta.env.VITE_SERVER_URL as string | undefined ?? '';
 const LARGE_FILE_BYTES = 4.5 * 1024 * 1024 * 1024;
 let currentVideos: VideoFile[] = [];
 let currentToken = '';

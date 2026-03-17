@@ -1,4 +1,4 @@
-const SERVER_URL = import.meta.env.VITE_SERVER_URL as string | undefined ?? 'http://localhost:3001';
+const SERVER_URL = import.meta.env.VITE_SERVER_URL as string | undefined ?? '';
 const BASE = `${SERVER_URL}/assemblyai`;
 
 interface TranscriptResponse {

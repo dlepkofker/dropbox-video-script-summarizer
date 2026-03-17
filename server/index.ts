@@ -2,15 +2,16 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { spawn } from 'child_process';
-import type { ChildProcessWithoutNullStreams } from 'child_process';
-import { Readable } from 'stream';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFile, mkdtemp, rm } from 'fs/promises';
+import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
 import { join, dirname } from 'path';
 import ffmpegPath from 'ffmpeg-static';
 import { createClient } from '@supabase/supabase-js';
 import OpenAI from 'openai';
 
+const FFMPEG        = process.env.FFMPEG_PATH ?? ffmpegPath as unknown as string;
 const APP_KEY       = process.env.DROPBOX_APP_KEY       ?? '';
 const APP_SECRET    = process.env.DROPBOX_APP_SECRET    ?? '';
 const AAI_KEY       = process.env.ASSEMBLYAI_API_KEY    ?? '';
@@ -20,7 +21,7 @@ const OPENAI_KEY    = process.env.OPENAI_API_KEY        ?? '';
 const OPENAI_MODEL  = process.env.OPENAI_MODEL          ?? 'gpt-4o';
 const PORT          = process.env.PORT                  ?? 3001;
 const FRONTEND_URL  = process.env.FRONTEND_URL          ?? 'http://localhost:5173';
-const REDIRECT_URI  = `http://localhost:${PORT}/auth/callback`;
+const REDIRECT_URI  = process.env.REDIRECT_URI ?? `http://localhost:${PORT}/auth/callback`;
 const TOKENS_FILE   = join(dirname(fileURLToPath(import.meta.url)), '.tokens.json');
 
 const missing = ['DROPBOX_APP_KEY', 'DROPBOX_APP_SECRET', 'ASSEMBLYAI_API_KEY', 'SUPABASE_URL', 'SUPABASE_ANON_KEY', 'OPENAI_API_KEY']
@@ -140,39 +141,61 @@ app.get('/assemblyai/transcript/:id', async (req, res) => {
 app.post('/extract-audio', async (req, res) => {
   const { dropboxUrl } = req.body as { dropboxUrl?: string };
   if (!dropboxUrl) { res.status(400).json({ error: 'dropboxUrl is required' }); return; }
-  if (!ffmpegPath) { res.status(500).json({ error: 'ffmpeg binary not found' }); return; }
 
   console.log('Extracting audio from:', dropboxUrl.slice(0, 80) + '…');
+  console.log('Using ffmpeg path:', FFMPEG);
 
-  const ffmpegProc = spawn(ffmpegPath as unknown as string, [
-    '-i', dropboxUrl, '-vn', '-acodec', 'libmp3lame', '-ab', '64k', '-f', 'mp3', 'pipe:1',
-  ]) as unknown as ChildProcessWithoutNullStreams;
+  const tmpDir = await mkdtemp(join(tmpdir(), 'audio-'));
+  const tmpFile = join(tmpDir, 'audio.mp3');
 
-  let stderrBuf = '';
-  ffmpegProc.stderr.on('data', (chunk: Buffer) => { stderrBuf += chunk.toString(); });
-  ffmpegProc.on('close', (code: number | null) => {
-    if (code !== 0) console.error(`FFmpeg exited ${code}\n${stderrBuf.slice(-1000)}`);
-    else console.log('FFmpeg finished');
-  });
-
-  let uploadRes: Response;
   try {
-    uploadRes = await (fetch as Function)(`${AAI_BASE}/upload`, {
+    await new Promise<void>((resolve, reject) => {
+      const ffmpegProc = spawn(FFMPEG, [
+        '-user_agent', 'Mozilla/5.0',     // some CDNs require a user-agent
+        '-i', dropboxUrl,
+        '-vn', '-acodec', 'libmp3lame', '-ab', '64k',
+        '-y', tmpFile,
+      ]);
+
+      // Hard kill after 20 minutes
+      const killTimer = setTimeout(() => {
+        ffmpegProc.kill('SIGKILL');
+        reject(new Error('FFmpeg timed out after 5 minutes'));
+      }, 5 * 60 * 1000);
+
+      let stderrBuf = '';
+      ffmpegProc.stderr.on('data', (chunk: Buffer) => {
+        const text = chunk.toString();
+        stderrBuf += text;
+        console.log('[ffmpeg]', text.trimEnd());
+      });
+      ffmpegProc.on('error', (err) => { clearTimeout(killTimer); reject(err); });
+      ffmpegProc.on('close', (code) => {
+        clearTimeout(killTimer);
+        if (code !== 0) reject(new Error(`FFmpeg exited ${code}: ${stderrBuf.slice(-800)}`));
+        else resolve();
+      });
+    });
+
+    console.log('FFmpeg finished, uploading to AssemblyAI…');
+
+    const audioBuffer = await readFile(tmpFile);
+    const uploadRes = await fetch(`${AAI_BASE}/upload`, {
       method: 'POST',
       headers: { Authorization: AAI_KEY, 'Content-Type': 'application/octet-stream' },
-      duplex: 'half',
-      body: Readable.toWeb(ffmpegProc.stdout),
+      body: audioBuffer,
     });
+
+    if (!uploadRes.ok) { res.status(500).json({ error: `AssemblyAI upload failed (${uploadRes.status}): ${await uploadRes.text()}` }); return; }
+
+    const { upload_url } = await uploadRes.json() as { upload_url: string };
+    console.log('Uploaded to AssemblyAI:', upload_url);
+    res.json({ upload_url });
   } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : String(err), ffmpeg_stderr: stderrBuf.slice(-500) });
-    return;
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true });
   }
-
-  if (!uploadRes.ok) { res.status(500).json({ error: `AssemblyAI upload failed (${uploadRes.status}): ${await uploadRes.text()}` }); return; }
-
-  const { upload_url } = await uploadRes.json() as { upload_url: string };
-  console.log('Uploaded to AssemblyAI:', upload_url);
-  res.json({ upload_url });
 });
 
 // ── Transcripts (Supabase) ─────────────────────────────────────────────────────
@@ -313,6 +336,12 @@ app.post('/generate', async (req, res) => {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
 });
+
+// ── Frontend static files ──────────────────────────────────────────────────────
+
+const distPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist');
+app.use(express.static(distPath));
+app.get('*', (_req, res) => res.sendFile(join(distPath, 'index.html')));
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
