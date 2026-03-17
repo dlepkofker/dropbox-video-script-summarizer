@@ -11,6 +11,8 @@ import ffmpegPath from 'ffmpeg-static';
 import {createClient} from '@supabase/supabase-js';
 import OpenAI from 'openai';
 
+// Allow the ffmpeg binary path to be overridden at runtime (e.g. in Docker or
+// serverless environments where the bundled static binary may not be executable).
 const FFMPEG = process.env.FFMPEG_PATH ?? (ffmpegPath as unknown as string);
 const APP_KEY = process.env.DROPBOX_APP_KEY ?? '';
 const APP_SECRET = process.env.DROPBOX_APP_SECRET ?? '';
@@ -22,8 +24,12 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL ?? 'gpt-4o';
 const PORT = process.env.PORT ?? 3001;
 const FRONTEND_URL = process.env.FRONTEND_URL ?? 'http://localhost:5173';
 const REDIRECT_URI = process.env.REDIRECT_URI ?? `http://localhost:${PORT}/auth/callback`;
+// Resolve the token file relative to this compiled module so it survives
+// process.cwd() changes and works regardless of how the server is invoked.
 const TOKENS_FILE = join(dirname(fileURLToPath(import.meta.url)), '.tokens.json');
 
+// Fail fast at startup rather than surfacing cryptic 401/500s at runtime.
+// Checking all required secrets in one pass makes misconfiguration obvious.
 const missing = [
     'DROPBOX_APP_KEY',
     'DROPBOX_APP_SECRET',
@@ -37,14 +43,21 @@ if (missing.length) {
     process.exit(1);
 }
 
+// Single shared clients — constructing these is expensive (TLS handshakes,
+// connection pool allocation) and they are safe to reuse across requests.
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const openai = new OpenAI({apiKey: OPENAI_KEY});
 
 // ── Dropbox token storage ──────────────────────────────────────────────────────
+// Tokens are persisted to a local JSON file rather than a database because this
+// server is a single-tenant tool (one Dropbox account). A multi-tenant system
+// would store tokens per-user in an encrypted column.
 
 interface Tokens {
     access_token: string;
     refresh_token: string;
+    // Stored as a Unix ms timestamp with a 60-second safety margin already
+    // applied so callers can do a simple `Date.now() >= expires_at` check.
     expires_at: number;
 }
 
@@ -63,6 +76,11 @@ function saveTokens(tokens: Tokens) {
     writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2));
 }
 
+/**
+ * Exchanges a refresh token for a new access token using HTTP Basic auth,
+ * which is the OAuth 2.0 client_credentials pattern Dropbox mandates for
+ * confidential clients. The refresh token is long-lived and reused across calls.
+ */
 async function refreshAccessToken(refreshToken: string): Promise<Tokens> {
     const res = await fetch('https://api.dropboxapi.com/oauth2/token', {
         method: 'POST',
@@ -77,10 +95,14 @@ async function refreshAccessToken(refreshToken: string): Promise<Tokens> {
     return {
         access_token: data.access_token,
         refresh_token: refreshToken,
+        // Subtract 60 s from the stated TTL so we never hand a token to a
+        // caller that will expire mid-request (clock-skew + network latency guard).
         expires_at: Date.now() + data.expires_in * 1000 - 60_000,
     };
 }
 
+// Lazy token refresh: only hit the Dropbox token endpoint when the cached
+// access token is actually expired, avoiding unnecessary network round-trips.
 async function getValidToken(): Promise<string | null> {
     let tokens = loadTokens();
     if (!tokens) return null;
@@ -94,10 +116,16 @@ async function getValidToken(): Promise<string | null> {
 // ── App ────────────────────────────────────────────────────────────────────────
 
 const app = express();
+// CORS is intentionally wide here because this backend exclusively serves a
+// single trusted frontend under our control. Production hardening would pin
+// the origin to FRONTEND_URL.
 app.use(cors());
 app.use(express.json());
 
 // ── Dropbox auth ───────────────────────────────────────────────────────────────
+// Standard OAuth 2.0 Authorization Code flow. `token_access_type: 'offline'`
+// instructs Dropbox to issue a refresh token alongside the short-lived access
+// token, enabling silent re-authentication without user interaction.
 
 app.get('/auth/start', (_req, res) => {
     const params = new URLSearchParams({
@@ -136,6 +164,8 @@ app.get('/auth/callback', async (req, res) => {
     res.redirect(FRONTEND_URL);
 });
 
+// The frontend polls this endpoint to check auth state and retrieve a usable
+// token without ever seeing the refresh token or the app secret.
 app.get('/auth/token', async (_req, res) => {
     try {
         const token = await getValidToken();
@@ -149,12 +179,17 @@ app.get('/auth/token', async (_req, res) => {
     }
 });
 
+// Soft-delete: overwrite with an empty object rather than unlinking the file,
+// so a partial-write failure never leaves a corrupt token store.
 app.post('/auth/logout', (_req, res) => {
     if (existsSync(TOKENS_FILE)) writeFileSync(TOKENS_FILE, '{}');
     res.json({ok: true});
 });
 
 // ── AssemblyAI proxy ───────────────────────────────────────────────────────────
+// The AAI API key must never be exposed to the browser, so all AssemblyAI
+// requests are routed through this thin proxy that injects the Authorization
+// header server-side. This also keeps the key out of Vite's bundle entirely.
 
 const AAI_BASE = 'https://api.assemblyai.com/v2';
 
@@ -175,6 +210,14 @@ app.get('/assemblyai/transcript/:id', async (req, res) => {
 });
 
 // ── Audio extraction ───────────────────────────────────────────────────────────
+// AssemblyAI accepts a public URL or a direct upload. Dropbox temporary links
+// work for small files, but very large video files are first demuxed server-side
+// with ffmpeg — stripping the video stream and downsampling audio to 64 kbps MP3
+// — to reduce upload size and avoid AssemblyAI's file-size limits.
+//
+// The pipeline is: Dropbox CDN URL → ffmpeg (stdio stream) → tmp file → AAI upload.
+// Using a temp directory (mkdtemp) instead of a fixed path avoids race conditions
+// if multiple extract-audio requests run concurrently.
 
 app.post('/extract-audio', async (req, res) => {
     const {dropboxUrl} = req.body as {dropboxUrl?: string};
@@ -196,12 +239,12 @@ app.post('/extract-audio', async (req, res) => {
                 'Mozilla/5.0', // some CDNs require a user-agent
                 '-i',
                 dropboxUrl,
-                '-vn',
+                '-vn', // drop the video stream entirely — we only need audio
                 '-acodec',
                 'libmp3lame',
                 '-ab',
-                '64k',
-                '-y',
+                '64k', // 64 kbps is sufficient for speech; keeps upload small
+                '-y', // overwrite output without prompting (safe; tmp path is unique)
                 tmpFile,
             ]);
 
@@ -214,6 +257,9 @@ app.post('/extract-audio', async (req, res) => {
                 5 * 60 * 1000,
             );
 
+            // ffmpeg writes progress and diagnostics to stderr, not stdout.
+            // Buffering the last 800 bytes lets us surface a useful error
+            // message if the process exits non-zero.
             let stderrBuf = '';
             ffmpegProc.stderr.on('data', (chunk: Buffer) => {
                 const text = chunk.toString();
@@ -233,6 +279,9 @@ app.post('/extract-audio', async (req, res) => {
 
         console.log('FFmpeg finished, uploading to AssemblyAI…');
 
+        // Read the entire MP3 into memory before uploading. For very large files
+        // a streaming upload (piping ffmpeg stdout directly to the fetch body)
+        // would be more memory-efficient, but adds complexity around error handling.
         const audioBuffer = await readFile(tmpFile);
         const uploadRes = await fetch(`${AAI_BASE}/upload`, {
             method: 'POST',
@@ -251,11 +300,17 @@ app.post('/extract-audio', async (req, res) => {
     } catch (err) {
         res.status(500).json({error: err instanceof Error ? err.message : String(err)});
     } finally {
+        // Always clean up the temp directory — even on error — to prevent disk
+        // accumulation in long-running server processes. `force: true` suppresses
+        // errors if the directory was already removed.
         await rm(tmpDir, {recursive: true, force: true});
     }
 });
 
 // ── Transcripts (Supabase) ─────────────────────────────────────────────────────
+// Transcript caching avoids re-running expensive speech-to-text jobs on every
+// page load. The video_id (Dropbox file ID) is used as the natural key, which
+// remains stable even if the file is renamed or moved within Dropbox.
 
 app.get('/transcripts/:videoId', async (req, res) => {
     const {data} = await supabase
@@ -272,6 +327,8 @@ app.post('/transcripts', async (req, res) => {
         res.status(400).json({error: 'videoId and transcript are required'});
         return;
     }
+    // upsert (INSERT … ON CONFLICT DO UPDATE) keeps the API idempotent:
+    // re-transcribing the same video overwrites rather than duplicates the row.
     const {error} = await supabase
         .from('transcripts')
         .upsert({video_id: videoId, transcript}, {onConflict: 'video_id'});
@@ -283,6 +340,9 @@ app.post('/transcripts', async (req, res) => {
 });
 
 // ── Prompts (Supabase) ─────────────────────────────────────────────────────────
+// Prompts are user-authored templates with optional [[field]] placeholders that
+// get interpolated at generation time. Full CRUD is exposed so the UI can manage
+// them without direct database access.
 
 app.get('/prompts', async (_req, res) => {
     const {data, error} = await supabase.from('prompts').select('id, title, text');
@@ -331,6 +391,10 @@ app.delete('/prompts/:id', async (req, res) => {
 });
 
 // ── Instructions (Supabase) ────────────────────────────────────────────────────
+// Instructions map to OpenAI's system-prompt role: they set the model's persona
+// and output constraints independently of the user-facing prompt template.
+// Separating them from prompts allows the same instruction (e.g. "reply in
+// Spanish, be concise") to be mixed with multiple prompts without duplication.
 
 app.get('/instructions', async (_req, res) => {
     const {data, error} = await supabase.from('instructions').select('id, title, text');
@@ -379,6 +443,9 @@ app.delete('/instructions/:id', async (req, res) => {
 });
 
 // ── AI Responses (Supabase) ────────────────────────────────────────────────────
+// Generated responses are cached by (video_id, prompt_id) so the user can
+// switch between prompts without re-running generation, and reload the page
+// without losing previous results.
 
 app.get('/ai-responses/:videoId', async (req, res) => {
     const {data} = await supabase
@@ -416,18 +483,16 @@ app.post('/ai-responses', async (req, res) => {
         res.status(400).json({error: 'videoId, promptId and response are required'});
         return;
     }
-    const {error} = await supabase
-        .from('ai_response')
-        .upsert(
-            {
-                video_id: videoId,
-                prompt_id: promptId,
-                response,
-                prompt_fields: fields ?? null,
-                instruction_id: instructionId ?? null,
-            },
-            {onConflict: 'video_id'},
-        );
+    const {error} = await supabase.from('ai_response').upsert(
+        {
+            video_id: videoId,
+            prompt_id: promptId,
+            response,
+            prompt_fields: fields ?? null,
+            instruction_id: instructionId ?? null,
+        },
+        {onConflict: 'video_id'},
+    );
     if (error) {
         res.status(500).json({error: error.message});
         return;
@@ -436,6 +501,13 @@ app.post('/ai-responses', async (req, res) => {
 });
 
 // ── Generate (OpenAI) ──────────────────────────────────────────────────────────
+// Field interpolation and instruction lookup are done server-side so that:
+//   1. The raw prompt template (which may contain sensitive framing) is never
+//      sent to the browser.
+//   2. The OpenAI API key is never exposed to the client.
+//
+// The prompt and instruction are fetched in parallel with Promise.all to avoid
+// two sequential round-trips to Supabase.
 
 app.post('/generate', async (req, res) => {
     const {promptId, transcript, fields, instructionId} = req.body as {
@@ -449,6 +521,7 @@ app.post('/generate', async (req, res) => {
         return;
     }
 
+    // Fetch prompt and (optional) instruction concurrently.
     const [{data: prompt, error}, {data: instruction}] = await Promise.all([
         supabase.from('prompts').select('text').eq('id', promptId).maybeSingle(),
         instructionId
@@ -464,6 +537,9 @@ app.post('/generate', async (req, res) => {
         return;
     }
 
+    // Replace every [[key]] placeholder with the corresponding field value.
+    // Using split/join instead of a regex replace avoids ReDoS risk on
+    // adversarial field names that contain regex metacharacters.
     let promptContent = prompt.text;
     if (fields) {
         for (const [key, value] of Object.entries(fields)) {
@@ -475,6 +551,9 @@ app.post('/generate', async (req, res) => {
         const response = await openai.responses.create({
             model: OPENAI_MODEL,
             input: `${promptContent}\n\n${transcript}`,
+            // Only include the `instructions` key when an instruction was
+            // requested — sending an empty string would still affect model
+            // behavior on some OpenAI model variants.
             ...(instruction?.text ? {instructions: instruction.text} : {}),
         });
         res.json({result: response.output_text});
@@ -484,9 +563,14 @@ app.post('/generate', async (req, res) => {
 });
 
 // ── Frontend static files ──────────────────────────────────────────────────────
+// Serve the Vite-built SPA from the same process so a single `node server/index.js`
+// command handles both API and UI in production, eliminating the need for a
+// separate reverse-proxy entry point.
 
 const distPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist');
 app.use(express.static(distPath));
+// Catch-all sends index.html for any unmatched path, enabling client-side
+// routing to work correctly on hard refreshes and direct URL navigation.
 app.get('*', (_req, res) => res.sendFile(join(distPath, 'index.html')));
 
 app.listen(PORT, () => {

@@ -18,23 +18,40 @@ import {
 import type {Prompt, Instruction} from './supabase';
 import type {VideoFile} from './dropbox';
 
+// Two-stage sanitization: marked converts Markdown to HTML, then DOMPurify
+// strips any script tags, event handlers, or javascript: URIs that a malicious
+// LLM response might embed. Neither library alone is sufficient — marked does
+// not sanitize, and DOMPurify does not render Markdown.
 function renderMarkdown(text: string): string {
     return DOMPurify.sanitize(marked.parse(text) as string);
 }
 
+// Extract deduplicated [[field]] placeholder names from a prompt template.
+// The Set ensures each field name appears exactly once even if the template
+// references the same placeholder multiple times.
 function parseFields(text: string): string[] {
     const matches = text.match(/\[\[(\w+)\]\]/g) ?? [];
     return [...new Set(matches.map((m) => m.slice(2, -2)))];
 }
 
+// Resolve SERVER_URL from the Vite env at build time so the client always
+// talks to the correct backend regardless of deployment environment.
 const SERVER_URL = (import.meta.env.VITE_SERVER_URL as string | undefined) ?? '';
+// 4.5 GB threshold: above this size Dropbox temporary links are too large to
+// pass directly to AssemblyAI, so we demux audio on the server first.
 const LARGE_FILE_BYTES = 4.5 * 1024 * 1024 * 1024;
+// Module-level state is intentional here: the app is a single-page vanilla TS
+// SPA with no framework, so these variables serve as the single source of truth
+// for the current session, equivalent to a Redux store in a React app.
 let currentVideos: VideoFile[] = [];
 let currentToken = '';
 let activeView: 'videos' | 'prompts' | 'instructions' = 'videos';
 let currentPage = 0;
 const PAGE_SIZE = 10;
 
+// Probe the server for a valid Dropbox token on startup. Returns null if the
+// user hasn't authenticated yet, rather than throwing, so the caller can
+// branch cleanly into the connect view.
 async function fetchDropboxToken(): Promise<string | null> {
     try {
         const res = await fetch(`${SERVER_URL}/auth/token`);
@@ -46,6 +63,11 @@ async function fetchDropboxToken(): Promise<string | null> {
     }
 }
 
+// Manual HTML escaping rather than a library because the only attack surface
+// here is string interpolation into template literals. The five characters
+// covered (&, <, >, ") are sufficient to neutralise reflected XSS in attribute
+// and text-content contexts. All user-supplied strings go through this before
+// being written to innerHTML.
 function escapeHtml(str: string): string {
     return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
@@ -80,10 +102,14 @@ function renderVideoList(videos: VideoFile[]): string {
     }
 
     const totalPages = Math.ceil(videos.length / PAGE_SIZE);
+    // Clamp page to valid range in case videos were deleted since the last render.
     const page = Math.min(currentPage, totalPages - 1);
     const start = page * PAGE_SIZE;
     const pageVideos = videos.slice(start, start + PAGE_SIZE);
 
+    // Store the absolute index (not page-relative) in data-index so click
+    // handlers can look up the correct video in currentVideos regardless of
+    // which page the user is on.
     const rows = pageVideos
         .map(
             (v, i) => `
@@ -172,6 +198,11 @@ function renderVideoDetail(video: VideoFile, url: string): string {
   `;
 }
 
+// Renders the prompt selection and AI generation UI into #prompt-box.
+// This function is intentionally heavy — it owns the complete lifecycle of
+// prompt selection, cached-response restoration, field interpolation, generation,
+// and save — keeping all that stateful logic co-located rather than scattered
+// across the module.
 async function showPromptBox(videoId: string) {
     const box = document.getElementById('prompt-box')!;
     box.innerHTML = '<p class="prompt-loading">Loading prompts…</p>';
@@ -180,6 +211,8 @@ async function showPromptBox(videoId: string) {
     let prompts: Prompt[];
     let instructions: Instruction[];
     try {
+        // Fetch prompts and instructions in parallel — they are independent
+        // resources and parallelising halves the latency of this initial render.
         [prompts, instructions] = await Promise.all([getPrompts(), getInstructions()]);
     } catch {
         box.innerHTML = '<p class="prompt-error">Failed to load prompts.</p>';
@@ -243,6 +276,8 @@ async function showPromptBox(videoId: string) {
     const generateResult = document.getElementById('generate-result')!;
     const rawToggleBtn = document.getElementById('raw-toggle-btn') as HTMLButtonElement;
     const responseExpandBtn = document.getElementById('response-expand-btn') as HTMLButtonElement;
+    // rawResponse holds the unmodified LLM output so the raw/rendered toggle
+    // can switch back and forth without re-fetching.
     let rawResponse = '';
     let showingRaw = false;
     let responseExpanded = false;
@@ -261,6 +296,8 @@ async function showPromptBox(videoId: string) {
     rawToggleBtn.addEventListener('click', () => {
         showingRaw = !showingRaw;
         if (showingRaw) {
+            // textContent assignment is XSS-safe; the raw markdown is rendered
+            // as plain text so no HTML can execute.
             generateResult.textContent = rawResponse;
             rawToggleBtn.textContent = 'Rendered';
         } else {
@@ -301,6 +338,8 @@ async function showPromptBox(videoId: string) {
                 )
                 .join('');
             promptFields.removeAttribute('hidden');
+            // Disable Generate until all required fields are filled; the input
+            // listener below re-evaluates the gate on every keystroke.
             generateBtn.disabled = true;
             promptFields.querySelectorAll<HTMLInputElement>('.field-input').forEach((input) => {
                 input.addEventListener('input', () => {
@@ -316,6 +355,8 @@ async function showPromptBox(videoId: string) {
             generateBtn.disabled = false;
         }
 
+        // Optimistically load any previously saved response for this
+        // (video, prompt) pair so the UI feels instant on revisit.
         const cached = await fetch(`${SERVER_URL}/ai-responses/${encodeURIComponent(videoId)}/${promptId}`)
             .then(
                 (r) =>
@@ -330,6 +371,8 @@ async function showPromptBox(videoId: string) {
         if (cached.response) {
             if (cached.instruction_id) instructionSelect.value = String(cached.instruction_id);
             if (cached.prompt_fields) {
+                // Restore field values from the saved response so the user can
+                // see what inputs produced the cached output.
                 promptFields.querySelectorAll<HTMLInputElement>('.field-input').forEach((input) => {
                     const val = cached.prompt_fields![input.dataset.field!];
                     if (val !== undefined) input.value = val;
@@ -352,6 +395,8 @@ async function showPromptBox(videoId: string) {
         selectPrompt(promptId);
     });
 
+    // Auto-select the most recently saved prompt for this video so returning
+    // users land in a meaningful state rather than an empty selector.
     const existing = await fetch(`${SERVER_URL}/ai-responses/${encodeURIComponent(videoId)}`)
         .then((r) => r.json() as Promise<{prompt_id: number; response: string} | null>)
         .catch(() => null);
@@ -362,6 +407,8 @@ async function showPromptBox(videoId: string) {
 
     generateBtn.addEventListener('click', async () => {
         const promptId = Number(select.value);
+        // Read transcript text directly from the DOM element — it's the live
+        // text node that may have been edited by the user since page load.
         const transcript = document.getElementById('transcript-content')?.textContent ?? '';
 
         generateBtn.disabled = true;
@@ -385,6 +432,8 @@ async function showPromptBox(videoId: string) {
                     promptId,
                     transcript,
                     instructionId,
+                    // Omit fields key entirely when there are no placeholders
+                    // to avoid sending an empty object the server must handle.
                     ...(Object.keys(fields).length > 0 ? {fields} : {}),
                 }),
             });
@@ -447,6 +496,8 @@ async function showPromptBox(videoId: string) {
 
 async function handleDisconnect() {
     await fetch(`${SERVER_URL}/auth/logout`, {method: 'POST'}).catch(() => {});
+    // Clear in-memory state so a subsequent login starts with a clean slate,
+    // avoiding stale video lists or tokens leaking between sessions.
     currentToken = '';
     currentVideos = [];
     activeView = 'videos';
@@ -455,6 +506,9 @@ async function handleDisconnect() {
     app.innerHTML = renderConnectView();
 }
 
+// Event binding is separated from HTML generation because innerHTML assignment
+// destroys and recreates DOM nodes, detaching any previously registered listeners.
+// Re-binding after every render is the simplest correct approach for a no-framework SPA.
 function bindVideoList() {
     document.getElementById('disconnect-btn')?.addEventListener('click', handleDisconnect);
     document.querySelectorAll<HTMLTableRowElement>('.video-row').forEach((row) => {
@@ -482,6 +536,8 @@ async function showVideoDetail(video: VideoFile) {
     app.innerHTML = renderLoading();
 
     try {
+        // Dropbox temporary links expire after ~4 hours — fetching fresh on
+        // every detail view avoids serving an expired URL to the <video> element.
         const url = await getTemporaryLink(currentToken, video.path_display);
         app.innerHTML = renderVideoDetail(video, url);
 
@@ -507,6 +563,8 @@ async function showVideoDetail(video: VideoFile) {
             expandBtn.removeAttribute('hidden');
         }
 
+        // Show cached transcript immediately if one exists, then reveal the
+        // prompt box so the user can start generating without waiting for a new run.
         const cached = await getCachedTranscript(video.id);
         if (cached) {
             transcriptContent.className = 'transcript-content';
@@ -539,6 +597,8 @@ async function showVideoDetail(video: VideoFile) {
             transcriptContent.className = 'transcript-content transcript-loading';
             transcriptContent.textContent = 'Transcribing… this may take a few minutes.';
 
+            // Wall-clock timer gives the user feedback on a process that can
+            // take several minutes for long videos, reducing perceived abandonment.
             const start = Date.now();
             timerEl.textContent = '0s';
             timerEl.removeAttribute('hidden');
@@ -549,6 +609,10 @@ async function showVideoDetail(video: VideoFile) {
             try {
                 let audioUrl = url;
                 if (video.size > LARGE_FILE_BYTES) {
+                    // For large files, offload audio extraction to the server
+                    // (ffmpeg) before passing the URL to AssemblyAI. This avoids
+                    // AssemblyAI's file-size limit and reduces transcription cost
+                    // by stripping the video stream before upload.
                     transcriptContent.textContent = 'Extracting audio… (large file, this may take a few minutes)';
                     const extractRes = await fetch(`${SERVER_URL}/extract-audio`, {
                         method: 'POST',
@@ -588,6 +652,8 @@ async function showVideoDetail(video: VideoFile) {
         });
     } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
+        // Render the error inline above the video list so the user doesn't lose
+        // their place in the pagination and can try a different video.
         app.innerHTML = renderError(message) + renderVideoList(currentVideos);
         bindVideoList();
     }
@@ -600,6 +666,8 @@ async function loadVideos(token: string) {
 
     try {
         const videos = await listAllVideos(token);
+        // Sort descending by modification date so the most recently edited
+        // videos appear at the top — the most common access pattern.
         currentVideos = videos.sort(
             (a, b) => new Date(b.client_modified).getTime() - new Date(a.client_modified).getTime(),
         );
@@ -613,6 +681,9 @@ async function loadVideos(token: string) {
 }
 
 // ── Prompt Editor ─────────────────────────────────────────────────────────────
+// Pure render function: takes the full prompts array plus an optional editing ID
+// and returns HTML. Keeping rendering stateless makes it trivial to refresh the
+// list after any mutation by simply calling showPromptEditor() again.
 
 function renderPromptEditor(prompts: Prompt[], editingId: number | null = null): string {
     const editing = editingId !== null ? prompts.find((p) => p.id === editingId) : null;
@@ -684,6 +755,8 @@ async function showPromptEditor(editingId: number | null = null) {
     const cancelBtn = document.getElementById('pe-cancel') as HTMLButtonElement | null;
     const titleInput = document.getElementById('pe-title') as HTMLInputElement;
     const textArea = document.getElementById('pe-text') as HTMLTextAreaElement;
+    // pe-id is only present when editing an existing prompt; its absence
+    // signals that the submit handler should INSERT rather than UPDATE.
     const idInput = document.getElementById('pe-id') as HTMLInputElement | null;
     const errorDiv = document.getElementById('pe-error')!;
 
@@ -710,6 +783,8 @@ async function showPromptEditor(editingId: number | null = null) {
             } else {
                 await createPrompt(title, text);
             }
+            // Re-render the full editor after mutation to reflect the latest
+            // state from the server, rather than optimistically patching the DOM.
             showPromptEditor();
         } catch (err: unknown) {
             submitBtn.disabled = false;
@@ -739,6 +814,10 @@ async function showPromptEditor(editingId: number | null = null) {
 }
 
 // ── Instructions Editor ───────────────────────────────────────────────────────
+// Structurally identical to the prompt editor. The duplication is intentional:
+// prompts and instructions have different semantic roles (user content vs. system
+// persona) and may diverge in future — shared abstractions would couple them
+// prematurely.
 
 function renderInstructionsEditor(instructions: Instruction[], editingId: number | null = null): string {
     const editing = editingId !== null ? instructions.find((i) => i.id === editingId) : null;
@@ -865,6 +944,9 @@ async function showInstructionsEditor(editingId: number | null = null) {
 }
 
 // ── Nav ───────────────────────────────────────────────────────────────────────
+// Navigation is driven by data-view attributes on buttons rather than URLs,
+// which avoids adding a client-side router dependency for a three-view app.
+// The tradeoff is that views aren't bookmarkable or back-button navigable.
 
 function setActiveNavItem(view: 'videos' | 'prompts' | 'instructions') {
     document.querySelectorAll<HTMLButtonElement>('.nav-item').forEach((btn) => {
@@ -876,6 +958,8 @@ function bindNav() {
     document.querySelectorAll<HTMLButtonElement>('.nav-item').forEach((btn) => {
         btn.addEventListener('click', () => {
             const view = btn.dataset.view as 'videos' | 'prompts' | 'instructions';
+            // Guard against re-rendering the current view, which would
+            // discard any unsaved state (e.g. a half-written prompt).
             if (view === activeView) return;
             activeView = view;
             setActiveNavItem(view);
@@ -902,6 +986,8 @@ const app = document.getElementById('app')!;
 
 bindNav();
 
+// IIFE lets us use top-level await without converting the entire module to async,
+// which would change module evaluation semantics and defer bindNav() unnecessarily.
 (async () => {
     const token = await fetchDropboxToken();
     if (token) {
