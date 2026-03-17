@@ -3,19 +3,24 @@ import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 import { listAllVideos, getTemporaryLink, formatBytes } from './dropbox';
 import { requestTranscript } from './assemblyai';
-import { getCachedTranscript, cacheTranscript, getPrompts, createPrompt, updatePrompt, deletePrompt } from './supabase';
-import type { Prompt } from './supabase';
+import { getCachedTranscript, cacheTranscript, getPrompts, createPrompt, updatePrompt, deletePrompt, getInstructions, createInstruction, updateInstruction, deleteInstruction } from './supabase';
+import type { Prompt, Instruction } from './supabase';
 import type { VideoFile } from './dropbox';
 
 function renderMarkdown(text: string): string {
   return DOMPurify.sanitize(marked.parse(text) as string);
 }
 
+function parseFields(text: string): string[] {
+  const matches = text.match(/\[\[(\w+)\]\]/g) ?? [];
+  return [...new Set(matches.map((m) => m.slice(2, -2)))];
+}
+
 const SERVER_URL = import.meta.env.VITE_SERVER_URL as string | undefined ?? 'http://localhost:3001';
 const LARGE_FILE_BYTES = 4.5 * 1024 * 1024 * 1024;
 let currentVideos: VideoFile[] = [];
 let currentToken = '';
-let activeView: 'videos' | 'prompts' = 'videos';
+let activeView: 'videos' | 'prompts' | 'instructions' = 'videos';
 let currentPage = 0;
 const PAGE_SIZE = 10;
 
@@ -158,9 +163,10 @@ async function showPromptBox(videoId: string) {
   box.innerHTML = '<p class="prompt-loading">Loading prompts…</p>';
   box.removeAttribute('hidden');
 
-  let prompts : Prompt[];
+  let prompts: Prompt[];
+  let instructions: Instruction[];
   try {
-    prompts = await getPrompts();
+    [prompts, instructions] = await Promise.all([getPrompts(), getInstructions()]);
   } catch {
     box.innerHTML = '<p class="prompt-error">Failed to load prompts.</p>';
     return;
@@ -171,9 +177,13 @@ async function showPromptBox(videoId: string) {
     return;
   }
 
-  const options = prompts
+  const promptOptions = prompts
     .map((p) => `<option value="${p.id}">${escapeHtml(p.title)}</option>`)
     .join('');
+
+  const instructionOptions = instructions.length > 0
+    ? instructions.map((i) => `<option value="${i.id}">${escapeHtml(i.title)}</option>`).join('')
+    : '<option value="">— No instructions available —</option>';
 
   box.innerHTML = `
     <div class="prompt-selector">
@@ -185,11 +195,16 @@ async function showPromptBox(videoId: string) {
         </div>
       </div>
       <div class="prompt-body">
+        <div class="instruction-row">
+          <label class="instruction-label" for="instruction-select">Instruction</label>
+          <select id="instruction-select">${instructionOptions}</select>
+        </div>
         <select id="prompt-select">
           <option value="">— Select a prompt —</option>
-          ${options}
+          ${promptOptions}
         </select>
         <div id="prompt-text" class="prompt-text" hidden></div>
+        <div id="prompt-fields" class="prompt-fields" hidden></div>
         <div id="result-wrapper" hidden>
           <div class="result-toolbar">
             <button id="raw-toggle-btn" class="raw-toggle-btn">Raw</button>
@@ -205,8 +220,10 @@ async function showPromptBox(videoId: string) {
     </div>
   `;
 
+  const instructionSelect = document.getElementById('instruction-select') as HTMLSelectElement;
   const select = document.getElementById('prompt-select') as HTMLSelectElement;
   const promptText = document.getElementById('prompt-text')!;
+  const promptFields = document.getElementById('prompt-fields')!;
   const generateBtn = document.getElementById('generate-btn') as HTMLButtonElement;
   const saveBtn = document.getElementById('save-response-btn') as HTMLButtonElement;
   const resultWrapper = document.getElementById('result-wrapper')!;
@@ -258,11 +275,42 @@ async function showPromptBox(videoId: string) {
     generateResult.textContent = '';
     generateResult.classList.remove('generate-error');
 
+    const fields = parseFields(prompt.text);
+    if (fields.length > 0) {
+      promptFields.innerHTML = fields.map((f) => `
+        <div class="field-row">
+          <label class="field-label" for="field-${escapeHtml(f)}">${escapeHtml(f)}</label>
+          <input class="field-input" id="field-${escapeHtml(f)}" type="text" placeholder="Enter ${escapeHtml(f)}…" data-field="${escapeHtml(f)}" />
+        </div>
+      `).join('');
+      promptFields.removeAttribute('hidden');
+      generateBtn.disabled = true;
+      promptFields.querySelectorAll<HTMLInputElement>('.field-input').forEach((input) => {
+        input.addEventListener('input', () => {
+          const allFilled = Array.from(promptFields.querySelectorAll<HTMLInputElement>('.field-input'))
+            .every((i) => i.value.trim() !== '');
+          generateBtn.disabled = !allFilled;
+        });
+      });
+    } else {
+      promptFields.innerHTML = '';
+      promptFields.hidden = true;
+      generateBtn.disabled = false;
+    }
+
     const cached = await fetch(`${SERVER_URL}/ai-responses/${encodeURIComponent(videoId)}/${promptId}`)
-      .then((r) => r.json() as Promise<{ response: string | null }>)
-      .catch(() => ({ response: null }));
+      .then((r) => r.json() as Promise<{ response: string | null; prompt_fields: Record<string, string> | null; instruction_id: number | null }>)
+      .catch(() => ({ response: null, prompt_fields: null, instruction_id: null }));
 
     if (cached.response) {
+      if (cached.instruction_id) instructionSelect.value = String(cached.instruction_id);
+      if (cached.prompt_fields) {
+        promptFields.querySelectorAll<HTMLInputElement>('.field-input').forEach((input) => {
+          const val = cached.prompt_fields![input.dataset.field!];
+          if (val !== undefined) input.value = val;
+        });
+        generateBtn.disabled = false;
+      }
       displayResponse(cached.response);
     }
   }
@@ -298,10 +346,15 @@ async function showPromptBox(videoId: string) {
     generateResult.classList.remove('generate-error');
 
     try {
+      const instructionId = Number(instructionSelect.value) || undefined;
+      const fieldInputs = promptFields.querySelectorAll<HTMLInputElement>('.field-input');
+      const fields: Record<string, string> = {};
+      fieldInputs.forEach((input) => { fields[input.dataset.field!] = input.value.trim(); });
+
       const res = await fetch(`${SERVER_URL}/generate`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ promptId, transcript }),
+        body: JSON.stringify({ promptId, transcript, instructionId, ...(Object.keys(fields).length > 0 ? { fields } : {}) }),
       });
       if (!res.ok) {
         const { error } = await res.json() as { error: string };
@@ -325,6 +378,10 @@ async function showPromptBox(videoId: string) {
   saveBtn.addEventListener('click', async () => {
     const promptId = Number(select.value);
     const response = rawResponse;
+    const instructionId = Number(instructionSelect.value) || undefined;
+    const fieldInputs = promptFields.querySelectorAll<HTMLInputElement>('.field-input');
+    const fields: Record<string, string> = {};
+    fieldInputs.forEach((input) => { fields[input.dataset.field!] = input.value.trim(); });
 
     saveBtn.disabled = true;
     saveBtn.textContent = 'Saving…';
@@ -333,7 +390,7 @@ async function showPromptBox(videoId: string) {
       const res = await fetch(`${SERVER_URL}/ai-responses`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ videoId, promptId, response }),
+        body: JSON.stringify({ videoId, promptId, response, instructionId, ...(Object.keys(fields).length > 0 ? { fields } : {}) }),
       });
       if (!res.ok) {
         const { error } = await res.json() as { error: string };
@@ -633,9 +690,127 @@ async function showPromptEditor(editingId: number | null = null) {
   });
 }
 
+// ── Instructions Editor ───────────────────────────────────────────────────────
+
+function renderInstructionsEditor(instructions: Instruction[], editingId: number | null = null): string {
+  const editing = editingId !== null ? instructions.find((i) => i.id === editingId) : null;
+
+  const formTitle = editing ? 'Edit Instruction' : 'New Instruction';
+  const submitLabel = editing ? 'Update' : 'Add Instruction';
+
+  const form = `
+    <div class="prompt-editor-form">
+      <h2>${formTitle}</h2>
+      ${editing ? `<input type="hidden" id="ie-id" value="${editing.id}" />` : ''}
+      <label for="ie-title">Title</label>
+      <input id="ie-title" type="text" placeholder="Instruction title" value="${editing ? escapeHtml(editing.title) : ''}" />
+      <label for="ie-text">Text</label>
+      <textarea id="ie-text" rows="6" placeholder="Instruction text…">${editing ? escapeHtml(editing.text) : ''}</textarea>
+      <div class="pe-form-actions">
+        <button id="ie-submit">${submitLabel}</button>
+        ${editing ? '<button id="ie-cancel" class="pe-cancel-btn">Cancel</button>' : ''}
+      </div>
+      <div id="ie-error" class="pe-error" hidden></div>
+    </div>
+  `;
+
+  const list = instructions.length === 0
+    ? '<p class="pe-empty">No instructions yet.</p>'
+    : instructions.map((i) => `
+      <div class="pe-prompt-row" data-id="${i.id}">
+        <div class="pe-prompt-info">
+          <span class="pe-prompt-title">${escapeHtml(i.title)}</span>
+          <span class="pe-prompt-text-preview">${escapeHtml(i.text.slice(0, 80))}${i.text.length > 80 ? '…' : ''}</span>
+        </div>
+        <div class="pe-prompt-actions">
+          <button class="ie-edit-btn save-btn" data-id="${i.id}">Edit</button>
+          <button class="ie-delete-btn pe-delete-btn" data-id="${i.id}">Delete</button>
+        </div>
+      </div>
+    `).join('');
+
+  return `
+    <div class="prompt-editor">
+      <div class="header"><h1>Instructions</h1></div>
+      ${form}
+      <div class="pe-list">${list}</div>
+    </div>
+  `;
+}
+
+async function showInstructionsEditor(editingId: number | null = null) {
+  const app = document.getElementById('app')!;
+  app.innerHTML = '<div class="loading"><div class="spinner"></div><p>Loading…</p></div>';
+
+  let instructions: Instruction[];
+  try {
+    instructions = await getInstructions();
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    app.innerHTML = renderError(message);
+    return;
+  }
+
+  app.innerHTML = renderInstructionsEditor(instructions, editingId);
+
+  const submitBtn = document.getElementById('ie-submit') as HTMLButtonElement;
+  const cancelBtn = document.getElementById('ie-cancel') as HTMLButtonElement | null;
+  const titleInput = document.getElementById('ie-title') as HTMLInputElement;
+  const textArea = document.getElementById('ie-text') as HTMLTextAreaElement;
+  const idInput = document.getElementById('ie-id') as HTMLInputElement | null;
+  const errorDiv = document.getElementById('ie-error')!;
+
+  function showError(msg: string) {
+    errorDiv.textContent = msg;
+    errorDiv.removeAttribute('hidden');
+  }
+
+  submitBtn.addEventListener('click', async () => {
+    const title = titleInput.value.trim();
+    const text = textArea.value.trim();
+    if (!title || !text) { showError('Title and text are required.'); return; }
+
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Saving…';
+    errorDiv.hidden = true;
+
+    try {
+      if (idInput) {
+        await updateInstruction(Number(idInput.value), title, text);
+      } else {
+        await createInstruction(title, text);
+      }
+      showInstructionsEditor();
+    } catch (err: unknown) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = idInput ? 'Update' : 'Add Instruction';
+      showError(err instanceof Error ? err.message : String(err));
+    }
+  });
+
+  cancelBtn?.addEventListener('click', () => showInstructionsEditor());
+
+  document.querySelectorAll<HTMLButtonElement>('.ie-edit-btn').forEach((btn) => {
+    btn.addEventListener('click', () => showInstructionsEditor(Number(btn.dataset.id)));
+  });
+
+  document.querySelectorAll<HTMLButtonElement>('.ie-delete-btn').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      btn.disabled = true;
+      try {
+        await deleteInstruction(Number(btn.dataset.id));
+        showInstructionsEditor();
+      } catch (err: unknown) {
+        btn.disabled = false;
+        alert(err instanceof Error ? err.message : String(err));
+      }
+    });
+  });
+}
+
 // ── Nav ───────────────────────────────────────────────────────────────────────
 
-function setActiveNavItem(view: 'videos' | 'prompts') {
+function setActiveNavItem(view: 'videos' | 'prompts' | 'instructions') {
   document.querySelectorAll<HTMLButtonElement>('.nav-item').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.view === view);
   });
@@ -644,12 +819,14 @@ function setActiveNavItem(view: 'videos' | 'prompts') {
 function bindNav() {
   document.querySelectorAll<HTMLButtonElement>('.nav-item').forEach((btn) => {
     btn.addEventListener('click', () => {
-      const view = btn.dataset.view as 'videos' | 'prompts';
+      const view = btn.dataset.view as 'videos' | 'prompts' | 'instructions';
       if (view === activeView) return;
       activeView = view;
       setActiveNavItem(view);
       if (view === 'prompts') {
         showPromptEditor();
+      } else if (view === 'instructions') {
+        showInstructionsEditor();
       } else {
         if (currentToken) {
           const app = document.getElementById('app')!;

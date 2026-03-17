@@ -59,3 +59,38 @@ export async function deletePrompt(id: number): Promise<void> {
   const res = await fetch(`${SERVER_URL}/prompts/${id}`, { method: 'DELETE' });
   if (!res.ok) throw await apiError(res);
 }
+
+export interface Instruction {
+  id: number;
+  title: string;
+  text: string;
+}
+
+export async function getInstructions(): Promise<Instruction[]> {
+  const res = await fetch(`${SERVER_URL}/instructions`);
+  if (!res.ok) throw await apiError(res);
+  return res.json() as Promise<Instruction[]>;
+}
+
+export async function createInstruction(title: string, text: string): Promise<void> {
+  const res = await fetch(`${SERVER_URL}/instructions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ title, text }),
+  });
+  if (!res.ok) throw await apiError(res);
+}
+
+export async function updateInstruction(id: number, title: string, text: string): Promise<void> {
+  const res = await fetch(`${SERVER_URL}/instructions/${id}`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ title, text }),
+  });
+  if (!res.ok) throw await apiError(res);
+}
+
+export async function deleteInstruction(id: number): Promise<void> {
+  const res = await fetch(`${SERVER_URL}/instructions/${id}`, { method: 'DELETE' });
+  if (!res.ok) throw await apiError(res);
+}

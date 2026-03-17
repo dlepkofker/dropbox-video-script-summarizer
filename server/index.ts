@@ -9,6 +9,7 @@ import { fileURLToPath } from 'url';
 import { join, dirname } from 'path';
 import ffmpegPath from 'ffmpeg-static';
 import { createClient } from '@supabase/supabase-js';
+import OpenAI from 'openai';
 
 const APP_KEY       = process.env.DROPBOX_APP_KEY       ?? '';
 const APP_SECRET    = process.env.DROPBOX_APP_SECRET    ?? '';
@@ -30,6 +31,7 @@ if (missing.length) {
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const openai = new OpenAI({ apiKey: OPENAI_KEY });
 
 // ── Dropbox token storage ──────────────────────────────────────────────────────
 
@@ -218,12 +220,42 @@ app.delete('/prompts/:id', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ── Instructions (Supabase) ────────────────────────────────────────────────────
+
+app.get('/instructions', async (_req, res) => {
+  const { data, error } = await supabase.from('instructions').select('id, title, text');
+  if (error) { res.status(500).json({ error: error.message }); return; }
+  res.json(data);
+});
+
+app.post('/instructions', async (req, res) => {
+  const { title, text } = req.body as { title?: string; text?: string };
+  if (!title || !text) { res.status(400).json({ error: 'title and text are required' }); return; }
+  const { error } = await supabase.from('instructions').insert({ title, text });
+  if (error) { res.status(500).json({ error: error.message }); return; }
+  res.json({ ok: true });
+});
+
+app.put('/instructions/:id', async (req, res) => {
+  const { title, text } = req.body as { title?: string; text?: string };
+  if (!title || !text) { res.status(400).json({ error: 'title and text are required' }); return; }
+  const { error } = await supabase.from('instructions').update({ title, text }).eq('id', Number(req.params.id));
+  if (error) { res.status(500).json({ error: error.message }); return; }
+  res.json({ ok: true });
+});
+
+app.delete('/instructions/:id', async (req, res) => {
+  const { error } = await supabase.from('instructions').delete().eq('id', Number(req.params.id));
+  if (error) { res.status(500).json({ error: error.message }); return; }
+  res.json({ ok: true });
+});
+
 // ── AI Responses (Supabase) ────────────────────────────────────────────────────
 
 app.get('/ai-responses/:videoId', async (req, res) => {
   const { data } = await supabase
     .from('ai_response')
-    .select('prompt_id, response')
+    .select('prompt_id, response, prompt_fields, instruction_id')
     .eq('video_id', req.params.videoId)
     .limit(1)
     .maybeSingle();
@@ -233,19 +265,19 @@ app.get('/ai-responses/:videoId', async (req, res) => {
 app.get('/ai-responses/:videoId/:promptId', async (req, res) => {
   const { data } = await supabase
     .from('ai_response')
-    .select('response')
+    .select('response, prompt_fields, instruction_id')
     .eq('video_id', req.params.videoId)
     .eq('prompt_id', Number(req.params.promptId))
     .maybeSingle();
-  res.json({ response: data?.response ?? null });
+  res.json({ response: data?.response ?? null, prompt_fields: data?.prompt_fields ?? null, instruction_id: data?.instruction_id ?? null });
 });
 
 app.post('/ai-responses', async (req, res) => {
-  const { videoId, promptId, response } = req.body as { videoId?: string; promptId?: number; response?: string };
+  const { videoId, promptId, response, fields, instructionId } = req.body as { videoId?: string; promptId?: number; response?: string; fields?: Record<string, string>; instructionId?: number };
   if (!videoId || !promptId || response === undefined) { res.status(400).json({ error: 'videoId, promptId and response are required' }); return; }
   const { error } = await supabase
     .from('ai_response')
-    .upsert({ video_id: videoId, prompt_id: promptId, response }, { onConflict: 'video_id' });
+    .upsert({ video_id: videoId, prompt_id: promptId, response, prompt_fields: fields ?? null, instruction_id: instructionId ?? null }, { onConflict: 'video_id' });
   if (error) { res.status(500).json({ error: error.message }); return; }
   res.json({ ok: true });
 });
@@ -253,26 +285,33 @@ app.post('/ai-responses', async (req, res) => {
 // ── Generate (OpenAI) ──────────────────────────────────────────────────────────
 
 app.post('/generate', async (req, res) => {
-  const { promptId, transcript } = req.body as { promptId?: number; transcript?: string };
+  const { promptId, transcript, fields, instructionId } = req.body as { promptId?: number; transcript?: string; fields?: Record<string, string>; instructionId?: number };
   if (!promptId || !transcript) { res.status(400).json({ error: 'promptId and transcript are required' }); return; }
 
-  const { data: prompt, error } = await supabase.from('prompts').select('text').eq('id', promptId).maybeSingle();
+  const [{ data: prompt, error }, { data: instruction }] = await Promise.all([
+    supabase.from('prompts').select('text').eq('id', promptId).maybeSingle(),
+    instructionId ? supabase.from('instructions').select('text').eq('id', instructionId).maybeSingle() : Promise.resolve({ data: null }),
+  ]);
   if (error) { res.status(500).json({ error: error.message }); return; }
   if (!prompt) { res.status(404).json({ error: 'Prompt not found' }); return; }
 
-  const openaiRes = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${OPENAI_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
+  let promptContent = prompt.text;
+  if (fields) {
+    for (const [key, value] of Object.entries(fields)) {
+      promptContent = promptContent.split(`[[${key}]]`).join(value);
+    }
+  }
+
+  try {
+    const response = await openai.responses.create({
       model: OPENAI_MODEL,
-      messages: [{ role: 'user', content: `${prompt.text}\n\n${transcript}` }],
-    }),
-  });
-
-  if (!openaiRes.ok) { res.status(500).json({ error: `OpenAI error: ${await openaiRes.text()}` }); return; }
-
-  const data = await openaiRes.json() as { choices: { message: { content: string } }[] };
-  res.json({ result: data.choices[0]?.message.content ?? '' });
+      input: `${promptContent}\n\n${transcript}`,
+      ...(instruction?.text ? { instructions: instruction.text } : {}),
+    });
+    res.json({ result: response.output_text });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+  }
 });
 
 app.listen(PORT, () => {
