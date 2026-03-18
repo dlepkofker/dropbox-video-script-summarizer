@@ -22,7 +22,8 @@ RUN npm ci
 # tsx needed at runtime since we skip the compile step
 RUN npm install tsx
 
-COPY server/index.ts server/tsconfig.json ./
+COPY server/index.ts server/migrate.ts server/tsconfig.json ./
+COPY supabase/migrations ../supabase/migrations
 
 EXPOSE 3001
 

@@ -8,6 +8,9 @@ primary_region = 'iad'
 
 [build]
 
+[deploy]
+  release_command = "node --import tsx/esm migrate.ts"
+
 [http_service]
   internal_port = 3001
   force_https = true
