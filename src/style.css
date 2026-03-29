@@ -518,6 +518,30 @@ tbody td {
   color: #fff;
 }
 
+.copy-btn {
+  padding: 5px 7px;
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  line-height: 0;
+}
+
+.copy-btn:not(:disabled):hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.copy-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.copy-btn:disabled:hover {
+  background: transparent;
+  color: var(--text-muted);
+  border-color: var(--border);
+}
+
 .transcript-body {
   position: relative;
 }
@@ -861,6 +885,13 @@ tbody td {
 .prompt-editor-form input[type="text"]:focus,
 .prompt-editor-form textarea:focus {
   border-color: var(--accent);
+}
+
+.pe-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
 }
 
 .pe-form-actions {

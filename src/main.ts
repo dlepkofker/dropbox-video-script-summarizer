@@ -182,6 +182,9 @@ function renderVideoDetail(video: VideoFile, url: string): string {
             <span id="transcript-timer" class="transcript-timer" hidden></span>
             <button id="save-transcript-btn" class="save-btn" hidden>Save</button>
             <button id="transcript-btn">Get Transcript</button>
+            <button id="copy-transcript-btn" class="copy-btn" title="Copy transcript" disabled>
+              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            </button>
           </div>
         </div>
         <div class="transcript-body">
@@ -254,6 +257,9 @@ async function showPromptBox(videoId: string) {
         <div id="result-wrapper" hidden>
           <div class="result-toolbar">
             <button id="raw-toggle-btn" class="raw-toggle-btn">Raw</button>
+            <button id="copy-response-btn" class="copy-btn" title="Copy response" disabled>
+              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            </button>
           </div>
           <div class="transcript-body">
             <div id="generate-result" class="generate-result"></div>
@@ -275,6 +281,7 @@ async function showPromptBox(videoId: string) {
     const resultWrapper = document.getElementById('result-wrapper')!;
     const generateResult = document.getElementById('generate-result')!;
     const rawToggleBtn = document.getElementById('raw-toggle-btn') as HTMLButtonElement;
+    const copyResponseBtn = document.getElementById('copy-response-btn') as HTMLButtonElement;
     const responseExpandBtn = document.getElementById('response-expand-btn') as HTMLButtonElement;
     // rawResponse holds the unmodified LLM output so the raw/rendered toggle
     // can switch back and forth without re-fetching.
@@ -291,7 +298,17 @@ async function showPromptBox(videoId: string) {
         generateResult.classList.remove('transcript-expanded');
         responseExpandBtn.querySelector('.expand-arrow')!.textContent = '▼';
         resultWrapper.removeAttribute('hidden');
+        copyResponseBtn.disabled = false;
     }
+
+    copyResponseBtn.addEventListener('click', async () => {
+        await navigator.clipboard.writeText(generateResult.textContent ?? '');
+        const svg = copyResponseBtn.innerHTML;
+        copyResponseBtn.textContent = '✓';
+        setTimeout(() => {
+            copyResponseBtn.innerHTML = svg;
+        }, 1500);
+    });
 
     rawToggleBtn.addEventListener('click', () => {
         showingRaw = !showingRaw;
@@ -549,6 +566,7 @@ async function showVideoDetail(video: VideoFile) {
 
         const transcriptBtn = document.getElementById('transcript-btn') as HTMLButtonElement;
         const saveBtn = document.getElementById('save-transcript-btn') as HTMLButtonElement;
+        const copyTranscriptBtn = document.getElementById('copy-transcript-btn') as HTMLButtonElement;
         const transcriptContent = document.getElementById('transcript-content')!;
         const expandBtn = document.getElementById('transcript-expand-btn') as HTMLButtonElement;
 
@@ -559,8 +577,22 @@ async function showVideoDetail(video: VideoFile) {
             expandBtn.querySelector('.expand-arrow')!.textContent = transcriptExpanded ? '▲' : '▼';
         });
 
+        copyTranscriptBtn.addEventListener('click', async () => {
+            const text = transcriptContent.textContent ?? '';
+            await navigator.clipboard.writeText(text);
+            const svg = copyTranscriptBtn.innerHTML;
+            copyTranscriptBtn.textContent = '✓';
+            setTimeout(() => {
+                copyTranscriptBtn.innerHTML = svg;
+            }, 1500);
+        });
+
         function showExpandBtn() {
             expandBtn.removeAttribute('hidden');
+        }
+
+        function enableCopyBtn() {
+            copyTranscriptBtn.disabled = false;
         }
 
         // Show cached transcript immediately if one exists, then reveal the
@@ -571,6 +603,7 @@ async function showVideoDetail(video: VideoFile) {
             transcriptContent.textContent = cached;
             transcriptBtn.textContent = 'Re-transcribe';
             showExpandBtn();
+            enableCopyBtn();
             showPromptBox(video.id);
         }
 
@@ -639,6 +672,7 @@ async function showVideoDetail(video: VideoFile) {
                 saveBtn.disabled = false;
                 saveBtn.hidden = false;
                 showExpandBtn();
+                enableCopyBtn();
                 showPromptBox(video.id);
             } catch (err: unknown) {
                 clearInterval(tick);
@@ -697,7 +731,12 @@ function renderPromptEditor(prompts: Prompt[], editingId: number | null = null):
       ${editing ? `<input type="hidden" id="pe-id" value="${editing.id}" />` : ''}
       <label for="pe-title">Title</label>
       <input id="pe-title" type="text" placeholder="Prompt title" value="${editing ? escapeHtml(editing.title) : ''}" />
-      <label for="pe-text">Text</label>
+      <div class="pe-label-row">
+        <label for="pe-text">Text</label>
+        <button id="pe-copy-btn" class="copy-btn" title="Copy text" ${editing && editing.text ? '' : 'disabled'}>
+          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+        </button>
+      </div>
       <textarea id="pe-text" rows="6" placeholder="Prompt text…">${editing ? escapeHtml(editing.text) : ''}</textarea>
       <div class="pe-form-actions">
         <button id="pe-submit">${submitLabel}</button>
@@ -755,10 +794,24 @@ async function showPromptEditor(editingId: number | null = null) {
     const cancelBtn = document.getElementById('pe-cancel') as HTMLButtonElement | null;
     const titleInput = document.getElementById('pe-title') as HTMLInputElement;
     const textArea = document.getElementById('pe-text') as HTMLTextAreaElement;
+    const copyBtn = document.getElementById('pe-copy-btn') as HTMLButtonElement;
     // pe-id is only present when editing an existing prompt; its absence
     // signals that the submit handler should INSERT rather than UPDATE.
     const idInput = document.getElementById('pe-id') as HTMLInputElement | null;
     const errorDiv = document.getElementById('pe-error')!;
+
+    textArea.addEventListener('input', () => {
+        copyBtn.disabled = textArea.value.trim() === '';
+    });
+
+    copyBtn.addEventListener('click', async () => {
+        await navigator.clipboard.writeText(textArea.value);
+        const svg = copyBtn.innerHTML;
+        copyBtn.textContent = '✓';
+        setTimeout(() => {
+            copyBtn.innerHTML = svg;
+        }, 1500);
+    });
 
     function showError(msg: string) {
         errorDiv.textContent = msg;
@@ -831,7 +884,12 @@ function renderInstructionsEditor(instructions: Instruction[], editingId: number
       ${editing ? `<input type="hidden" id="ie-id" value="${editing.id}" />` : ''}
       <label for="ie-title">Title</label>
       <input id="ie-title" type="text" placeholder="Instruction title" value="${editing ? escapeHtml(editing.title) : ''}" />
-      <label for="ie-text">Text</label>
+      <div class="pe-label-row">
+        <label for="ie-text">Text</label>
+        <button id="ie-copy-btn" class="copy-btn" title="Copy text" ${editing && editing.text ? '' : 'disabled'}>
+          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+        </button>
+      </div>
       <textarea id="ie-text" rows="6" placeholder="Instruction text…">${editing ? escapeHtml(editing.text) : ''}</textarea>
       <div class="pe-form-actions">
         <button id="ie-submit">${submitLabel}</button>
@@ -889,8 +947,22 @@ async function showInstructionsEditor(editingId: number | null = null) {
     const cancelBtn = document.getElementById('ie-cancel') as HTMLButtonElement | null;
     const titleInput = document.getElementById('ie-title') as HTMLInputElement;
     const textArea = document.getElementById('ie-text') as HTMLTextAreaElement;
+    const copyBtn = document.getElementById('ie-copy-btn') as HTMLButtonElement;
     const idInput = document.getElementById('ie-id') as HTMLInputElement | null;
     const errorDiv = document.getElementById('ie-error')!;
+
+    textArea.addEventListener('input', () => {
+        copyBtn.disabled = textArea.value.trim() === '';
+    });
+
+    copyBtn.addEventListener('click', async () => {
+        await navigator.clipboard.writeText(textArea.value);
+        const svg = copyBtn.innerHTML;
+        copyBtn.textContent = '✓';
+        setTimeout(() => {
+            copyBtn.innerHTML = svg;
+        }, 1500);
+    });
 
     function showError(msg: string) {
         errorDiv.textContent = msg;
