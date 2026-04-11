@@ -47,6 +47,7 @@ let currentVideos: VideoFile[] = [];
 let currentToken = '';
 let activeView: 'videos' | 'prompts' | 'instructions' = 'videos';
 let currentPage = 0;
+let searchQuery = '';
 const PAGE_SIZE = 10;
 
 // Probe the server for a valid Dropbox token on startup. Returns null if the
@@ -101,23 +102,33 @@ function renderVideoList(videos: VideoFile[]): string {
     `;
     }
 
-    const totalPages = Math.ceil(videos.length / PAGE_SIZE);
+    const query = searchQuery.toLowerCase();
+    // Build an array of original indices so data-index always points into
+    // currentVideos, even when the list is filtered.
+    const filteredIndices = query
+        ? videos.reduce<number[]>((acc, v, i) => {
+              if (v.name.toLowerCase().includes(query)) acc.push(i);
+              return acc;
+          }, [])
+        : videos.map((_, i) => i);
+
+    const totalPages = Math.ceil(filteredIndices.length / PAGE_SIZE);
     // Clamp page to valid range in case videos were deleted since the last render.
-    const page = Math.min(currentPage, totalPages - 1);
+    const page = Math.min(currentPage, Math.max(0, totalPages - 1));
     const start = page * PAGE_SIZE;
-    const pageVideos = videos.slice(start, start + PAGE_SIZE);
+    const pageIndices = filteredIndices.slice(start, start + PAGE_SIZE);
 
     // Store the absolute index (not page-relative) in data-index so click
     // handlers can look up the correct video in currentVideos regardless of
     // which page the user is on.
-    const rows = pageVideos
+    const rows = pageIndices
         .map(
-            (v, i) => `
-    <tr class="video-row" data-index="${start + i}">
-      <td class="col-name">${escapeHtml(v.name)}</td>
-      <td class="col-path">${escapeHtml(v.path_display)}</td>
-      <td class="col-size">${formatBytes(v.size)}</td>
-      <td class="col-date">${new Date(v.client_modified).toLocaleDateString()}</td>
+            (idx) => `
+    <tr class="video-row" data-index="${idx}">
+      <td class="col-name">${escapeHtml(videos[idx].name)}</td>
+      <td class="col-path">${escapeHtml(videos[idx].path_display)}</td>
+      <td class="col-size">${formatBytes(videos[idx].size)}</td>
+      <td class="col-date">${new Date(videos[idx].client_modified).toLocaleDateString()}</td>
     </tr>
   `,
         )
@@ -134,14 +145,31 @@ function renderVideoList(videos: VideoFile[]): string {
   `
             : '';
 
+    const countLabel = query
+        ? `${filteredIndices.length} of ${videos.length} video${videos.length !== 1 ? 's' : ''}`
+        : `${videos.length} video${videos.length !== 1 ? 's' : ''}`;
+
+    const noResults =
+        filteredIndices.length === 0 ? `<div class="empty">No videos match "${escapeHtml(searchQuery)}".</div>` : '';
+
     return `
     <div class="header">
       <h1>Dropbox Video Browser</h1>
       <div class="header-right">
-        <span class="count">${videos.length} video${videos.length !== 1 ? 's' : ''}</span>
+        <span class="count">${countLabel}</span>
         <button id="disconnect-btn">Disconnect</button>
       </div>
     </div>
+    <div class="search-bar">
+      <input
+        id="search-input"
+        type="search"
+        placeholder="Search videos by name…"
+        value="${escapeHtml(searchQuery)}"
+        autocomplete="off"
+      />
+    </div>
+    ${noResults}
     <div class="table-wrapper">
       <table>
         <thead>
@@ -518,6 +546,7 @@ async function handleDisconnect() {
     currentToken = '';
     currentVideos = [];
     activeView = 'videos';
+    searchQuery = '';
     setActiveNavItem('videos');
     const app = document.getElementById('app')!;
     app.innerHTML = renderConnectView();
@@ -545,6 +574,19 @@ function bindVideoList() {
         const app = document.getElementById('app')!;
         app.innerHTML = renderVideoList(currentVideos);
         bindVideoList();
+    });
+    document.getElementById('search-input')?.addEventListener('input', (e) => {
+        searchQuery = (e.target as HTMLInputElement).value;
+        currentPage = 0;
+        const app = document.getElementById('app')!;
+        app.innerHTML = renderVideoList(currentVideos);
+        bindVideoList();
+        // Restore focus and cursor position after re-render.
+        const input = document.getElementById('search-input') as HTMLInputElement | null;
+        if (input) {
+            input.focus();
+            input.setSelectionRange(input.value.length, input.value.length);
+        }
     });
 }
 

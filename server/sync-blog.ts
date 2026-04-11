@@ -54,8 +54,7 @@ export async function runSync(): Promise<SyncResult> {
 
 // CLI entry point guard — prevents auto-execution when Phase 3 imports runSync()
 // In ESM (NodeNext), there is no require.main === module; check argv instead
-const isMain =
-    process.argv[1]?.endsWith('sync-blog.ts') || process.argv[1]?.endsWith('sync-blog.js');
+const isMain = process.argv[1]?.endsWith('sync-blog.ts') || process.argv[1]?.endsWith('sync-blog.js');
 
 if (isMain) {
     const result = await runSync();

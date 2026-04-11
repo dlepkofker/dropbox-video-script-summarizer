@@ -29,11 +29,7 @@ const EMBED_MODEL = 'text-embedding-3-small';
  * @param model  OpenAI model to use (caller passes OPENAI_MODEL constant)
  * @returns Concise English semantic summary of the transcript
  */
-export async function preprocessTranscript(
-    openai: OpenAI,
-    transcript: string,
-    model: string,
-): Promise<string> {
+export async function preprocessTranscript(openai: OpenAI, transcript: string, model: string): Promise<string> {
     const response = await openai.responses.create({
         model,
         input: transcript,
@@ -57,11 +53,7 @@ export async function preprocessTranscript(
  * @param summary  Preprocessed English semantic summary to embed and query with
  * @returns Array of matching ChunkRow objects (empty array when no matches)
  */
-export async function retrieveChunks(
-    supabase: SupabaseClient,
-    openai: OpenAI,
-    summary: string,
-): Promise<ChunkRow[]> {
+export async function retrieveChunks(supabase: SupabaseClient, openai: OpenAI, summary: string): Promise<ChunkRow[]> {
     // Embed the summary as a single string (not array) — one embedding per request
     const embeddingRes = await openai.embeddings.create({
         model: EMBED_MODEL,
@@ -73,12 +65,14 @@ export async function retrieveChunks(
     const {data, error} = await supabase.rpc('match_blog_chunks', {
         query_embedding: embedding,
         match_count: 5,
-        match_threshold: 0.70,
+        match_threshold: 0.5,
     });
 
     if (error) {
         throw new Error(`match_blog_chunks RPC failed: ${error.message}`);
     }
+
+    console.log(`[vector data] ${data}`);
 
     // data is null or empty array when no matches above threshold — return [] in both cases
     if (!data || (data as ChunkRow[]).length === 0) {
@@ -111,10 +105,7 @@ export async function retrieveChunks(
  * @param instructionText  User-selected instruction text from Supabase, or null if none selected
  * @returns Assembled instructions string, or null if both chunks and instructionText are absent
  */
-export function buildInstructions(
-    chunks: ChunkRow[] | null,
-    instructionText: string | null,
-): string | null {
+export function buildInstructions(chunks: ChunkRow[] | null, instructionText: string | null): string | null {
     const parts: string[] = [];
 
     if (chunks && chunks.length > 0) {

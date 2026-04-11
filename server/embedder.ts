@@ -52,10 +52,7 @@ export async function embedAndStore(
 
     // Delete existing chunks for this URL before inserting new ones
     // (chunk count may change if content grows/shrinks — upsert by index is unsafe)
-    const {error: deleteError} = await supabase
-        .from('blog_chunks')
-        .delete()
-        .eq('url', url);
+    const {error: deleteError} = await supabase.from('blog_chunks').delete().eq('url', url);
     if (deleteError) throw new Error(`Delete failed for ${url}: ${deleteError.message}`);
 
     // Insert new chunks with embeddings

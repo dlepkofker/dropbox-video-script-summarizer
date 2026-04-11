@@ -231,6 +231,29 @@ button:hover {
   color: var(--text-muted);
 }
 
+/* ── Search bar ───────────────────────────────────────── */
+
+.search-bar {
+  margin-bottom: 12px;
+}
+
+.search-bar input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 12px;
+  font-size: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.search-bar input:focus {
+  border-color: var(--accent);
+}
+
 /* ── Table ────────────────────────────────────────────── */
 
 .table-wrapper {

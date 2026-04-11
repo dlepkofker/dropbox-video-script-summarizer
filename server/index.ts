@@ -559,12 +559,18 @@ app.post('/generate', async (req, res) => {
     let ragChunks: ChunkRow[] | null = null;
     try {
         const summary = await preprocessTranscript(openai, transcript, OPENAI_MODEL);
+        console.log(`[summary] ${summary}`);
         ragChunks = await retrieveChunks(supabase, openai, summary);
     } catch (err) {
-        console.warn('[rag] Retrieval failed, falling back to instructions-only:', err instanceof Error ? err.message : String(err));
+        console.warn(
+            '[rag] Retrieval failed, falling back to instructions-only:',
+            err instanceof Error ? err.message : String(err),
+        );
     }
 
     const builtInstructions = buildInstructions(ragChunks, instruction?.text ?? null);
+
+    console.log(`[instructions] ${builtInstructions}`);
 
     try {
         const response = await openai.responses.create({

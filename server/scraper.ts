@@ -39,9 +39,7 @@ export async function crawlBlogUrls(): Promise<string[]> {
     return postUrls;
 }
 
-export async function scrapePost(
-    url: string,
-): Promise<{title: string; body: string; urlHash: string}> {
+export async function scrapePost(url: string): Promise<{title: string; body: string; urlHash: string}> {
     await delay(RATE_LIMIT_MS);
 
     const res = await fetch(url, {headers: {'User-Agent': USER_AGENT}});
