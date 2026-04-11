@@ -10,6 +10,9 @@ import {join, dirname} from 'path';
 import ffmpegPath from 'ffmpeg-static';
 import {createClient} from '@supabase/supabase-js';
 import OpenAI from 'openai';
+import cron from 'node-cron';
+import {runSync} from './sync-blog.js';
+import {preprocessTranscript, retrieveChunks, buildInstructions, type ChunkRow} from './rag.js';
 
 // Allow the ffmpeg binary path to be overridden at runtime (e.g. in Docker or
 // serverless environments where the bundled static binary may not be executable).
@@ -24,6 +27,10 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL ?? 'gpt-4o';
 const PORT = process.env.PORT ?? 3001;
 const FRONTEND_URL = process.env.FRONTEND_URL ?? 'http://localhost:5173';
 const REDIRECT_URI = process.env.REDIRECT_URI ?? `http://localhost:${PORT}/auth/callback`;
+const ADMIN_SECRET = process.env.ADMIN_SECRET ?? '';
+if (!ADMIN_SECRET) {
+    console.warn('[startup] ADMIN_SECRET is not set — POST /admin/sync-blog will return 401 for all requests');
+}
 // Resolve the token file relative to this compiled module so it survives
 // process.cwd() changes and works regardless of how the server is invoked.
 const TOKENS_FILE = join(dirname(fileURLToPath(import.meta.url)), '.tokens.json');
@@ -547,20 +554,61 @@ app.post('/generate', async (req, res) => {
         }
     }
 
+    // RAG: preprocess transcript → embed summary → retrieve blog chunks
+    // Wrapped in try/catch — any failure falls back to instructions-only (RETR-05)
+    let ragChunks: ChunkRow[] | null = null;
+    try {
+        const summary = await preprocessTranscript(openai, transcript, OPENAI_MODEL);
+        ragChunks = await retrieveChunks(supabase, openai, summary);
+    } catch (err) {
+        console.warn('[rag] Retrieval failed, falling back to instructions-only:', err instanceof Error ? err.message : String(err));
+    }
+
+    const builtInstructions = buildInstructions(ragChunks, instruction?.text ?? null);
+
     try {
         const response = await openai.responses.create({
             model: OPENAI_MODEL,
             input: `${promptContent}\n\n${transcript}`,
-            // Only include the `instructions` key when an instruction was
-            // requested — sending an empty string would still affect model
-            // behavior on some OpenAI model variants.
-            ...(instruction?.text ? {instructions: instruction.text} : {}),
+            ...(builtInstructions ? {instructions: builtInstructions} : {}),
         });
         res.json({result: response.output_text});
     } catch (err) {
         res.status(500).json({error: err instanceof Error ? err.message : String(err)});
     }
 });
+
+// ── Admin: manual sync trigger ─────────────────────────────────────────────────
+// Requires X-Admin-Secret header matching ADMIN_SECRET env var.
+// Returns 401 for missing/wrong secret. Returns sync result on success.
+// Note: ADMIN_SECRET being empty causes 401 for ALL requests (Pitfall 6 guard).
+app.post('/admin/sync-blog', async (req, res) => {
+    const provided = req.headers['x-admin-secret'];
+    if (!provided || !ADMIN_SECRET || provided !== ADMIN_SECRET) {
+        res.status(401).json({error: 'Unauthorized'});
+        return;
+    }
+    try {
+        const result = await runSync();
+        res.json({ok: true, ...result});
+    } catch (err) {
+        res.status(500).json({error: err instanceof Error ? err.message : String(err)});
+    }
+});
+
+// ── Scheduled sync (node-cron) ─────────────────────────────────────────────────
+// Runs daily at 2 AM UTC. Async wrapper with try/catch prevents unhandled
+// rejection from crashing the process on sync failure (Pitfall 1).
+cron.schedule('0 2 * * *', async () => {
+    console.log('[cron] Starting daily blog sync…');
+    try {
+        const result = await runSync();
+        console.log(`[cron] Done: ${result.processed} processed, ${result.skipped} skipped, ${result.failed} failed`);
+    } catch (err) {
+        console.error('[cron] Sync failed:', err instanceof Error ? err.message : String(err));
+    }
+});
+console.log('[cron] Daily blog sync scheduled at 0 2 * * * (2 AM UTC)');
 
 // ── Frontend static files ──────────────────────────────────────────────────────
 // Serve the Vite-built SPA from the same process so a single `node server/index.js`
