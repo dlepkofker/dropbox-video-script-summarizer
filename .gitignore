@@ -31,3 +31,4 @@ server/.tokens.json
 *.njsproj
 *.sln
 *.sw?
+.planning/
